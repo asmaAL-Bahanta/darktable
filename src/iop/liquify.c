@@ -336,7 +336,6 @@ typedef struct {
 
   cairo_t *fake_cr;     ///< A fake cairo context for hit testing and coordinate transform.
 
-  gboolean mouse_pointer_in_view;
   gboolean mouse_pointer_in_widget;
   GtkLabel *label;
   GtkToggleButton *btn_no_tool, *btn_point_tool, *btn_line_tool, *btn_curve_tool, *btn_node_tool;
@@ -754,14 +753,6 @@ static void distort_paths_raw_to_cairo (const struct dt_iop_module_t *module,
   _distort_paths (&params, paths);
 }
 
-static void distort_paths_cairo_to_raw (const struct dt_iop_module_t *module,
-                                        const dt_dev_pixelpipe_iop_t *piece,
-                                        const GList *paths)
-{
-  const distort_params_t params = { module->dev, piece->pipe, CAIRO_SCALE, RAW_SCALE, false, 0, 99999 };
-  _distort_paths (&params, paths);
-}
-
 static void distort_paths_raw_to_piece (const struct dt_iop_module_t *module,
                                         const dt_dev_pixelpipe_iop_t *piece,
                                         const double roi_in_scale,
@@ -772,17 +763,6 @@ static void distort_paths_raw_to_piece (const struct dt_iop_module_t *module,
   const distort_params_t params = { module->dev, piece->pipe, RAW_SCALE, roi_in_scale, true, 0, module->priority };
   _distort_paths (&params, paths);
 }
-
-#if 0
-static void distort_paths_piece_to_raw (const struct dt_iop_module_t *module,
-                                        const dt_dev_pixelpipe_iop_t *piece,
-                                        const double roi_in_scale,
-                                        const GList *paths)
-{
-  const distort_params_t params = { module->dev, piece->pipe, roi_in_scale, RAW_SCALE, false, 0, module->priority };
-  _distort_paths (&params, paths);
-}
-#endif
 
 static double complex distort_point_cairo_to_raw (const struct dt_iop_module_t *module,
                                                   const dt_dev_pixelpipe_iop_t *piece,
@@ -938,25 +918,6 @@ static inline __m128 sqrt_ps (const __m128 x)
   return _mm_mul_ps (yy, _mm_sub_ps (_mm_constants.threehalfs, x2yy));
 }
 
-/**
- * Compute the radius of an ellipse at angle phi.  Compute the
- * distance from the center of the ellipse to the point on the
- * circumference at angle @a phi.
- *
- * @param a    Length of the major semi-axis.
- * @param b    Length of the minor semi-axis.
- * @param phi  Angle in radians from the major semi-axis.
- *
- * @return     The radius.
- */
-
-static float ellipse_r_at_phi (const float a, const float b, const float phi)
-{
-  const float asinphi = a * sin (phi);
-  const float bcosphi = b * cos (phi);
-  return a * b / sqrt (bcosphi * bcosphi + asinphi * asinphi);
-}
-
 static void mix_warps (dt_liquify_warp_t *result,
                        const dt_liquify_warp_t *warp1,
                        const dt_liquify_warp_t *warp2,
@@ -975,16 +936,6 @@ static void mix_warps (dt_liquify_warp_t *result,
   result->strength = pt + r * cexp (phi * I);
 
   result->point    = pt;
-}
-
-static void rectangle_union (cairo_rectangle_int_t *acc, const cairo_rectangle_int_t *r)
-{
-  const int x2 = MAX (acc->x + acc->width,  r->x + r->width);
-  const int y2 = MAX (acc->y + acc->height, r->y + r->height);
-  acc->x = MIN (acc->x, r->x);
-  acc->y = MIN (acc->y, r->y);
-  acc->width  = x2 - acc->x;
-  acc->height = y2 - acc->y;
 }
 
 void debug_rect (const char *msg, const cairo_rectangle_int_t *r)
@@ -1006,35 +957,6 @@ void debug_piece (const dt_dev_pixelpipe_iop_t *piece)
          piece->buf_in.width, piece->buf_in.height);
 }
 
-
-/**
- * Interpolate a line into a series of points.
- *
- * @param  p0      The starting point of the line.
- * @param  p1      The ending point of the line.
- * @param  buffer  Preallocated buffer of size n.
- * @param  n       Number of points to interpolate. buffer[0] = p0 and buffer[n-1] = p1.
- */
-
-static void interpolate_line (const float complex p0,
-                              const float complex p1,
-                              float complex buffer[],
-                              const int n)
-{
-  const float complex V = p1 - p0;
-
-  float complex *buf = buffer;
-  const float step = 1.0 / n;
-  float t = step;
-  *buf++ = p0;
-
-  for (int i = 1; i < n - 1; ++i)
-  {
-    *buf++ = p0 + V * t;
-    t += step;
-  }
-  *buf = p1;
-}
 
 /**
  * Interpolate a cubic bezier spline into a series of points.
@@ -1142,95 +1064,6 @@ static const float complex point_at_arc_length (const float complex points[],
 
   return points[n_points - 1];
 }
-
-/**
- * Interpolate the first derivative of a curve at a specified arc length.
- *
- * In a bezier curve the parameter t usually does not correspond to
- * the arc length.
- *
- * FIXME: for added hack value we could use cubic interpolation here.
- *
- * @param  points      Array of points.
- * @param  n_points    No. of points in array.
- * @param  arc_length  Arc length.
- */
-
-static const float complex deriv_at_arc_length (const float complex points[],
-                                                const int n_points,
-                                                const double arc_length,
-                                                restart_cookie_t *restart)
-{
-  double length = restart ? restart->length : 0.0;
-  int i         = restart ? restart->i      : 1;
-
-  for ( ; i < n_points; i++)
-  {
-    const double prev_length = length;
-    length += cabsf (points[i-1] - points[i]);
-    if (length >= arc_length) {
-      if (restart)
-      {
-        restart->i = i;
-        restart->length = prev_length;
-      }
-      return points[i] - points[i-1];
-    }
-  }
-  if (n_points > 1)
-    return points[n_points - 1] - points[n_points - 2];
-  return 0.0f;
-}
-
-#if 0
-/**
- * Interpolate a cubic bezier spline.  Interpolates a cubic bezier
- * spline into a series of line segments. We use an algorithm that
- * yields segments of fairly regular length.
- *
- * @param  p0  The starting point of the bezier.
- * @param  p1  First control point.
- * @param  p2  Second control point.
- * @param  p3  End point.
- * @param  n   Number of segments to interpolate.
- *
- * @return A list containing the starting point in absolute coords
- *         followed by @a n deltas in relative coords.
- */
-
-static GList *interpolate_cubic_bezier_old (const float complex p0, const float complex p1,
-                                            const float complex p2, const float complex p3, const int n)
-{
-  GList *deltas = NULL;
-  const float complex last = p0;
-
-  float complex *pp = malloc (sizeof (float complex));
-  *pp = p0;
-  deltas = g_list_append (deltas, pp);
-
-  for (int j = 1; j < n; j++)
-  {
-    const float t = (1.0 * j) / n;
-    const float t1 = 1.0 - t;
-    const float complex ip =
-          t1 * t1 * t1 * p0 +
-      3 * t1 * t1 * t  * p1 +
-      3 * t1 * t  * t  * p2 +
-          t  * t  * t  * p3;
-
-    pp = malloc (sizeof (float complex));
-    *pp = ip - last;
-    deltas = g_list_append (deltas, pp);
-    last = ip;
-  }
-
-  pp = malloc (sizeof (float complex));
-  *pp = p3 - last;
-  deltas = g_list_append (deltas, pp);
-
-  return deltas;
-}
-#endif
 
 /**
  * Build a lookup table for the warp intensity.
@@ -1582,63 +1415,6 @@ static double complex * _get_point (const GList *path)
   return NULL;
 }
 
-static double complex *_get_ctrl1 (GList *path)
-{
-  if (path && path->data)
-  {
-    const dt_liquify_curve_to_v1_t *c = (dt_liquify_curve_to_v1_t *) path->data;
-    if (c->header.type == DT_LIQUIFY_PATH_CURVE_TO_V1)
-      return &c->ctrl1;
-  }
-  return NULL;
-}
-
-static double complex *_get_ctrl2 (GList *path)
-{
-  if (path && path->data)
-  {
-    const dt_liquify_curve_to_v1_t *c = (dt_liquify_curve_to_v1_t *) path->data;
-    if (c->header.type == DT_LIQUIFY_PATH_CURVE_TO_V1)
-      return &c->ctrl2;
-  }
-  return NULL;
-}
-
-#if 0
-static double complex _get_direction (GList *path)
-{
-  if (!path)
-    return 0.0;
-  if (!path->next && !path->prev)
-    return 1.0; // lone point, no direction
-
-  double complex ld = 1.0, rd = 1.0;
-
-  if (path->next)
-  {
-    double complex *point = _get_point (path);
-    dt_liquify_path_data_t *next = path->next->data;
-    if (next->header.type == DT_LIQUIFY_PATH_LINE_TO_V1)
-      rd = next->point - *point;
-    else
-      if (next->header.type == DT_LIQUIFY_PATH_CURVE_TO_V1)
-        rd = next->curve_to_v1.ctrl1 - *point;
-    return normalize (rd);
-  }
-  if (path->prev)
-  {
-    dt_liquify_path_data_t *this = path->data;
-    if (this->header.type == DT_LIQUIFY_PATH_LINE_TO_V1)
-      ld = this->point - *_get_point (path->prev);
-    else
-      if (this->header.type == DT_LIQUIFY_PATH_CURVE_TO_V1)
-        ld = this->point - this->curve_to_v1.ctrl2;
-    return normalize (ld);
-  }
-  return 1.0; // make compiler happy
-}
-#endif
-
 static void move_to (cairo_t *cr, double complex pt)
 {
   cairo_move_to (cr, creal (pt), cimag (pt));
@@ -1653,50 +1429,6 @@ static void curve_to (cairo_t *cr, double complex pt1, double complex pt2, doubl
 {
   cairo_curve_to (cr, creal (pt1), cimag (pt1), creal (pt2), cimag (pt2), creal (pt3), cimag (pt3));
 }
-
-#if 0
-static float complex transform_point (cairo_matrix_t* m, float complex p)
-{
-  double x = creal (p);
-  double y = cimag (p);
-  cairo_matrix_transform_point (m, &x, &y);
-  return x + y * I;
-}
-
-static float complex transform_distance (const cairo_matrix_t* m, const float complex p)
-{
-  const double x = creal (p);
-  const double y = cimag (p);
-  cairo_matrix_transform_distance (m, &x, &y);
-  return x + y * I;
-}
-
-static void transform_paths (const GList *paths, const cairo_matrix_t *matrix)
-{
-  for (GList *i = paths; i != NULL; i = i->next)
-  {
-    for (GList *j = i->data; j != NULL; j = j->next)
-    {
-      dt_liquify_path_data_t *data = (dt_liquify_path_data_t *) j->data;
-      switch (data->header.type)
-      {
-      case DT_LIQUIFY_PATH_CURVE_TO_V1:
-        data->curve_to_v1.ctrl1 = transform_point (matrix, data->curve_to_v1.ctrl1);
-        data->curve_to_v1.ctrl2 = transform_point (matrix, data->curve_to_v1.ctrl2);
-        // fall thru
-      case DT_LIQUIFY_PATH_MOVE_TO_V1:
-      case DT_LIQUIFY_PATH_LINE_TO_V1:
-        data->warp.point    = transform_point (matrix, data->warp.point);
-        data->warp.radius   = transform_point (matrix, data->warp.radius);
-        data->warp.strength = transform_point (matrix, data->warp.strength);
-        break;
-      default:
-        break;
-      }
-    }
-  }
-}
-#endif
 
 /**
  * Calculate the map extent.
@@ -2238,11 +1970,6 @@ static void set_source_rgba (cairo_t *cr, dt_liquify_rgba_t rgba)
   cairo_set_source_rgba (cr, rgba.red, rgba.green, rgba.blue, rgba.alpha);
 }
 
-static void set_source_rgb (const cairo_t *cr, const dt_liquify_rgba_t rgba, const double alpha)
-{
-  cairo_set_source_rgba (cr, rgba.red, rgba.green, rgba.blue, alpha);
-}
-
 static double get_ui_width (const double scale, const dt_liquify_ui_width_enum_t w)
 {
   assert (w >= 0 && w < DT_LIQUIFY_UI_WIDTH_LAST);
@@ -2255,15 +1982,6 @@ static void set_line_width (cairo_t *cr, double scale, dt_liquify_ui_width_enum_
 {
   const double width = get_ui_width (scale, w);
   cairo_set_line_width (cr, width);
-}
-
-static void set_dash (const cairo_t *cr,
-                      const double scale,
-                      const dt_liquify_ui_width_enum_t on,
-                      const dt_liquify_ui_width_enum_t off)
-{
-  const double dashes[2] = { get_ui_width (scale, on), get_ui_width (scale, off) };
-  cairo_set_dash (cr, dashes, 2, 0);
 }
 
 static bool detect_drag (const dt_iop_liquify_gui_data_t *g, const double scale, const double complex pt)
@@ -3105,132 +2823,6 @@ static void smooth_paths_linsys (dt_iop_liquify_gui_data_t *g)
   }
 }
 
-#if 0
-
-/**
- * Convert a Catmull-Rom polynomial to Bezier form.
- *
- * See section 3 of
- * http://www.cemyuksel.com/research/catmullrom_param/catmullrom.pdf
- *
- * @param p0      Catmull control point 0
- * @param p1
- * @param p2
- * @param p3
- * @param alpha   Use 0.0 for uniform parameterization, 0.5 for centripetal,
- *                and 1.0 for cordal.
- * @param ctrl1   Bezier control point 1
- * @param ctrl2   Bezier control point 2
- */
-
-static void catmull_to_bezier (double complex p0, double complex p1, double complex p2, double complex p3, double alpha, double complex *ctrl1, double complex *ctrl2)
-{
-  double d1 = cabs (p1 - p0);
-  double d2 = cabs (p2 - p1);
-  double d3 = cabs (p3 - p2);
-
-  double d1a = pow (d1, alpha);
-  double d2a = pow (d2, alpha);
-  double d3a = pow (d3, alpha);
-
-  double d12a = pow (d1, 2 * alpha);
-  double d22a = pow (d2, 2 * alpha);
-  double d32a = pow (d3, 2 * alpha);
-
-  *ctrl1 = (d12a * p2 - d22a * p0 + (2 * d12a + 3 * d1a * d2a + d22a) * p1)
-           /
-           (3 * d1a * (d1a + d2a));
-
-  *ctrl2 = (d32a * p1 - d22a * p3 + (2 * d32a + 3 * d3a * d2a + d22a) * p2)
-           /
-           (3 * d3a * (d3a + d2a));
-}
-
-/**
- * Convert a Catmull-Rom polynomial to Bezier form.
- *
- * Calculate the second Bezier control point of p1 using three points
- * on the curve: p0, p1, and p2.  A Catmull-Rom polynomial goes
- * through four points, but the second Bezier control point of p1 is
- * influenced only by the first three points.
- *
- * To calculate both Bezier control points for a segment p1 -- p2,
- * first calculate the second Bezier control point of p1 by feeding
- * p0, p1, and p2, then calculate the first Bezier control point of p2
- * by feeding p3, p2, and p1.
- *
- * For the formula used here see section 3 of
- * http://www.cemyuksel.com/research/catmullrom_param/catmullrom.pdf
- *
- * Note that in Catmull-Rom splines the first derivative is continuous
- * across a node, while the second derivative is not.  (They are C1
- * continuous.)  Converting a Catmull-Rom spline to Bezier will
- * produce around one node control points collinear with the node but
- * at different distance from the node. For an alternative approach
- * with continuous second derivative see:
- * http://www.particleincell.com/blog/2012/bezier-splines/
- *
- * @param p0      Catmull control point 0
- * @param p1
- * @param p2
- * @param alpha   Use 0.0 for uniform parameterization, 0.5 for centripetal,
- *                and 1.0 for cordal.
- * @param ctrl1   Bezier control point 1
- */
-
-static void catmull_to_bezier_3 (double complex p0, double complex p1, double complex p2, double alpha, double complex *ctrl1)
-{
-  const double d1 = cabs (p1 - p0);
-  const double d2 = cabs (p2 - p1);
-
-  const double d1a = pow (d1, alpha);
-  const double d2a = pow (d2, alpha);
-
-  const double d12a = pow (d1, 2 * alpha);
-  const double d22a = pow (d2, 2 * alpha);
-
-  *ctrl1 = (d12a * p2 - d22a * p0 + (2 * d12a + 3 * d1a * d2a + d22a) * p1)
-           /
-           (3 * d1a * (d1a + d2a));
-}
-
-static void smooth_paths_catmull (dt_iop_liquify_gui_data_t *g)
-{
-  for (GList *i = g->paths; i != NULL; i = i->next)
-  {
-    const size_t n = g_list_length (i->data);
-    if (n < 4)
-      continue;
-
-    for (GList *j = i->data; j != NULL; j = j->next)
-    {
-      // check: this segment is a bezier curve and an autosmooth node
-      const dt_liquify_curve_to_v1_t *d  = (dt_liquify_curve_to_v1_t *) j->data;
-      if (d->header.type == DT_LIQUIFY_PATH_CURVE_TO_V1 &&
-          d->header.node_type == DT_LIQUIFY_NODE_TYPE_AUTOSMOOTH)
-      {
-        // we are an autosmooth node. we can smooth our ctrl2, that is
-        // the control point immediately before us and the next node's
-        // ctrl1, that is the control point immedialely after us
-
-        if (j->prev && j->next)
-        {
-          const double complex *p0  = _get_point (j->prev);
-          const double complex *p1  = _get_point (j);
-          const double complex *p2  = _get_point (j->next);
-          catmull_to_bezier_3 (*p2, *p1, *p0, 0.5, &d->ctrl2);
-
-          const dt_liquify_curve_to_v1_t *n  = (dt_liquify_curve_to_v1_t *) j->next->data;
-          if (n->header.type == DT_LIQUIFY_PATH_CURVE_TO_V1)
-            catmull_to_bezier_3 (*p0, *p1, *p2, 0.5, &n->ctrl1);
-        }
-      }
-    }
-  }
-}
-
-#endif
-
 static GList *find_link (GList *paths, dt_liquify_path_data_t *node)
 {
   for (GList *i = paths; i != NULL; i = i->next)
@@ -3378,13 +2970,6 @@ static float get_zoom_scale (dt_develop_t *develop)
   return dt_dev_get_zoom_scale (develop, zoom, closeup ? 2 : 1, 1);
 }
 
-static double complex get_pointer_zoom_pos (struct dt_iop_module_t *module, double x, double y)
-{
-  float pzx, pzy;
-  dt_dev_get_pointer_zoom_pos (module->dev, x, y, &pzx, &pzy);
-  return (pzx + 0.5) + (pzy + 0.5) * I;
-}
-
 void gui_post_expose (struct dt_iop_module_t *module,
                       cairo_t *cr,
                       int32_t width,
@@ -3443,14 +3028,6 @@ void gui_focus (struct dt_iop_module_t *module, gboolean in)
 
   dt_iop_liquify_gui_data_t *g = (dt_iop_liquify_gui_data_t *) module->gui_data;
   g->mouse_pointer_in_widget = module->enabled && in;
-}
-
-static void dt_liquify_history_change_callback (gpointer instance, gpointer user_data)
-{
-  PRINT_FUNC ();
-
-  // struct dt_iop_module_t *module = (dt_iop_module_t *) user_data;
-  // dt_iop_liquify_gui_data_t *g = (dt_iop_liquify_gui_data_t *) module->gui_data;
 }
 
 static void sync_pipe (struct dt_iop_module_t *module, bool history)
@@ -4056,53 +3633,6 @@ done:
   return handled;
 }
 
-#if 0
-
-int key_pressed (struct dt_iop_module_t *module, guint key, guint state)
-{
-  PRINT_FUNC ();
-
-  // dt_iop_liquify_gui_data_t *g = (dt_iop_liquify_gui_data_t *) module->gui_data;
-
-  return 0;
-}
-
-int key_released (struct dt_iop_module_t *module, guint key, guint state)
-{
-  PRINT_FUNC ();
-
-  // shift key == 65505
-  // b = 98
-  // n = 110
-  // p = 112
-  // s = 115
-  // del = 65535
-  // bs =
-  return 0;
-}
-
-int mouse_enter (struct dt_iop_module_t *module)
-{
-  PRINT_FUNC ();
-
-  dt_iop_liquify_gui_data_t *g = (dt_iop_liquify_gui_data_t *) module->gui_data;
-
-  g->mouse_pointer_in_view = 1;
-  return 0;
-}
-
-int mouse_leave (struct dt_iop_module_t *module)
-{
-  PRINT_FUNC ();
-
-  dt_iop_liquify_gui_data_t *g = (dt_iop_liquify_gui_data_t *) module->gui_data;
-
-  g->mouse_pointer_in_view = 0;
-  return 0;
-}
-#endif
-
-
 /**@}*/
 
 static void _liquify_cairo_paint_no_tool
@@ -4174,7 +3704,6 @@ void gui_init (dt_iop_module_t *module)
   g->last_mouse_pos =
   g->last_button1_pressed_pos = -1;
   g->last_hit = NOWHERE;
-  g->mouse_pointer_in_view =
   g->mouse_pointer_in_widget = 0;
   dt_pthread_mutex_init (&g->lock, NULL);
 
@@ -4347,24 +3876,6 @@ static void _liquify_cairo_paint_curve_tool (cairo_t *cr,
   cairo_stroke (cr);
   POSTAMBLE;
 }
-
-#if 0
-static void _liquify_cairo_paint_select_tool (cairo_t *cr,
-                                              const gint x, const gint y, const gint w, const gint h, const gint flags)
-{
-  PREAMBLE;
-  cairo_move_to (cr, 0.0,  0.0);
-  cairo_line_to (cr, 0.3,  1.0);
-  cairo_line_to (cr, 1.0,  0.3);
-  cairo_close_path (cr);
-  cairo_fill (cr);
-
-  cairo_move_to (cr, 0.5,  0.5);
-  cairo_line_to (cr, 1.0,  1.0);
-  cairo_stroke (cr);
-  POSTAMBLE;
-}
-#endif
 
 static void _liquify_cairo_paint_node_tool (cairo_t *cr,
                                             const gint x, const gint y, const gint w, const gint h, const gint flags)
